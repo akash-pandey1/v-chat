@@ -2,7 +2,9 @@
 import { ref, onMounted } from "vue";
 import { io } from "socket.io-client";
 
-const socket = io("http://localhost:3000"); // backend URL
+const socket_url = import.meta.env.VITE_API_URL
+
+const socket = io(socket_url); // backend URL
 
 const localVideo = ref(null);
 const remoteVideo = ref(null);
