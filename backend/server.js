@@ -9,13 +9,13 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
     cors: {
-        origin: process.env.PROD_FRONTEND || "http://localhost:5173",
+        origin: process.env.PROD_FRONTEND,
         methods: ["GET", "POST"],
     },
 });
 
 app.use(cors( {
-    origin: process.env.PROD_FRONTEND || "http://localhost:5173",
+    origin: process.env.PROD_FRONTEND,
     methods: ["GET", "POST"],
     credentials: true
     
