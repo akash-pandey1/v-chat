@@ -21,6 +21,10 @@ app.use(cors( {
     
 }));
 
+app.get('/health', (req, res) => {
+  res.status(200).json({ status: 'ok', message: 'Backend is running' });
+});
+
 io.on("connection", (socket) => {
   console.log("User connected:", socket.id);
 
