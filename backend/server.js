@@ -30,30 +30,41 @@ io.on("connection", (socket) => {
 
   // Join room
   socket.on("join-room", (roomId) => {
+    const usersInRoom = io.sockets.adapter.rooms.get(roomId);
+    const userCount = usersInRoom ? usersInRoom.size : 0;
+    
     socket.join(roomId);
-    console.log(`User ${socket.id} joined room ${roomId}`);
+    console.log(`User ${socket.id} joined room ${roomId}. Total users: ${userCount + 1}`);
 
-    // Notify others
+    // Send list of existing users to the new user
+    const existingUsers = Array.from(usersInRoom || []).filter(id => id !== socket.id);
+    socket.emit("existing-users", existingUsers);
+
+    // Notify others that a new user joined
     socket.to(roomId).emit("user-joined", socket.id);
   });
 
-  // Offer
-  socket.on("offer", ({ roomId, offer }) => {
-    socket.to(roomId).emit("offer", offer);
+  // Offer (send to specific user)
+  socket.on("offer", ({ roomId, offer, to }) => {
+    io.to(to).emit("offer", { from: socket.id, offer });
   });
 
-  // Answer
-  socket.on("answer", ({ roomId, answer }) => {
-    socket.to(roomId).emit("answer", answer);
+  // Answer (send to specific user)
+  socket.on("answer", ({ roomId, answer, to }) => {
+    io.to(to).emit("answer", { from: socket.id, answer });
   });
 
-  // ICE candidate
-  socket.on("ice-candidate", ({ roomId, candidate }) => {
-    socket.to(roomId).emit("ice-candidate", candidate);
+  // ICE candidate (send to specific user)
+  socket.on("ice-candidate", ({ roomId, candidate, to }) => {
+    if (to) {
+      io.to(to).emit("ice-candidate", { from: socket.id, candidate });
+    }
   });
 
+  // Notify user disconnection
   socket.on("disconnect", () => {
     console.log("User disconnected:", socket.id);
+    socket.broadcast.emit("user-disconnected", socket.id);
   });
 });
 
