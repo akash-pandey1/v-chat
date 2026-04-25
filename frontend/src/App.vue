@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted, reactive } from "vue";
+import { ref, onMounted, reactive, watch, nextTick } from "vue";
 import { io } from "socket.io-client";
 
 const socket_url = import.meta.env.VITE_API_URL;
@@ -7,12 +7,16 @@ const socket = io(socket_url);
 
 const localVideo = ref(null);
 const localStream = ref(null);
-const remoteVideos = reactive({});
+const remoteVideos = ref(new Map());
+const remoteVideoRefs = reactive({});
 const peers = reactive({});
+const peerStates = reactive({}); // Track connection state for each peer
+const iceCandidateQueue = {}; // Queue for early ICE candidates
 const roomId = ref("test-room");
 const isVideoEnabled = ref(true);
 const isAudioEnabled = ref(true);
 const connectionStatus = ref("Connecting...");
+const hasJoined = ref(false);
 
 // ICE servers (STUN and TURN for better connectivity)
 const config = {
@@ -28,8 +32,11 @@ async function createPeerConnection(userId, initiator = false) {
     return peers[userId];
   }
 
+  console.log(`Creating peer connection for ${userId}, initiator: ${initiator}`);
   const peer = new RTCPeerConnection(config);
   peers[userId] = peer;
+  peerStates[userId] = { initiator, localDescriptionSet: false, remoteDescriptionSet: false };
+  iceCandidateQueue[userId] = [];
 
   // Add local stream tracks to the peer connection
   if (localStream.value) {
@@ -38,10 +45,25 @@ async function createPeerConnection(userId, initiator = false) {
     });
   }
 
-  // Handle remote stream
+  // Handle remote stream directly
   peer.ontrack = (event) => {
     console.log("Received remote track from", userId);
-    remoteVideos[userId] = event.streams[0];
+    console.log("Track kind:", event.track.kind);
+    
+    const stream = event.streams[0];
+    if (stream) {
+      remoteVideos.value.set(userId, stream);
+      // Trigger Vue reactivity
+      remoteVideos.value = new Map(remoteVideos.value);
+      
+      // Ensure video element syncs when it exists
+      nextTick(() => {
+        const videoEl = remoteVideoRefs[userId];
+        if (videoEl && videoEl.srcObject !== stream) {
+          videoEl.srcObject = stream;
+        }
+      });
+    }
   };
 
   // Send ICE candidates
@@ -61,7 +83,17 @@ async function createPeerConnection(userId, initiator = false) {
 
   // Handle connection state changes
   peer.onconnectionstatechange = () => {
-    console.log(`Connection state with ${userId}:`, peer.connectionState);
+    console.log(`🔗 Connection state with ${userId}:`, peer.connectionState);
+  };
+
+  // Monitor ICE connection state
+  peer.oniceconnectionstatechange = () => {
+    console.log(`❄️ ICE connection state with ${userId}:`, peer.iceConnectionState);
+  };
+
+  // Monitor ICE gathering state
+  peer.onicegatheringstatechange = () => {
+    console.log(`❄️ ICE gathering state with ${userId}:`, peer.iceGatheringState);
   };
 
   return peer;
@@ -74,7 +106,9 @@ async function startCamera() {
       audio: true,
     });
     localStream.value = stream;
-    localVideo.value.srcObject = stream;
+    if (localVideo.value) {
+      localVideo.value.srcObject = stream;
+    }
     connectionStatus.value = "Connected";
   } catch (err) {
     console.error("Error accessing media devices:", err);
@@ -82,13 +116,34 @@ async function startCamera() {
   }
 }
 
-// When an existing user is in the room, create offer
+async function joinCall() {
+  hasJoined.value = true;
+  // wait for DOM to update so localVideo ref is bound
+  await nextTick(); 
+  await startCamera();
+  socket.emit("join-room", roomId.value);
+}
+
+// When an existing user is in the room, wait for their offer
 socket.on("existing-users", async (users) => {
+  console.log("Existing users in room:", users);
   for (const userId of users) {
-    console.log("Creating offer for existing user:", userId);
-    const peer = await createPeerConnection(userId, true);
+    console.log("Waiting for offer from existing user:", userId);
+    // We optionally create the peer connection here, but DO NOT create an offer.
+    // The existing user will receive "user-joined" and send us an offer.
+    await createPeerConnection(userId, false);
+  }
+});
+
+// When a new user joins, create offer
+socket.on("user-joined", async (userId) => {
+  console.log("New user joined:", userId);
+  const peer = await createPeerConnection(userId, true);
+  try {
     const offer = await peer.createOffer();
     await peer.setLocalDescription(offer);
+    peerStates[userId].localDescriptionSet = true;
+    
     socket.emit("offer", {
       roomId: roomId.value,
       offer: {
@@ -97,23 +152,9 @@ socket.on("existing-users", async (users) => {
       },
       to: userId,
     });
+  } catch (err) {
+    console.error("Error creating offer for new user", userId, err);
   }
-});
-
-// When a new user joins, create offer
-socket.on("user-joined", async (userId) => {
-  console.log("New user joined:", userId);
-  const peer = await createPeerConnection(userId, true);
-  const offer = await peer.createOffer();
-  await peer.setLocalDescription(offer);
-  socket.emit("offer", {
-    roomId: roomId.value,
-    offer: {
-      type: offer.type,
-      sdp: offer.sdp,
-    },
-    to: userId,
-  });
 });
 
 // Receive offer
@@ -125,24 +166,39 @@ socket.on("offer", async ({ from, offer }) => {
   }
   
   const peer = await createPeerConnection(from, false);
+  
   try {
-    await peer.setRemoteDescription(
-      new RTCSessionDescription({
-        type: offer.type,
-        sdp: offer.sdp,
-      })
-    );
+    // Only set remote description if we haven't already
+    if (!peerStates[from].remoteDescriptionSet) {
+      await peer.setRemoteDescription(
+        new RTCSessionDescription({
+          type: offer.type,
+          sdp: offer.sdp,
+        })
+      );
+      peerStates[from].remoteDescriptionSet = true;
 
-    const answer = await peer.createAnswer();
-    await peer.setLocalDescription(answer);
-    socket.emit("answer", {
-      roomId: roomId.value,
-      answer: {
-        type: answer.type,
-        sdp: answer.sdp,
-      },
-      to: from,
-    });
+      // Process queued ICE candidates
+      if (iceCandidateQueue[from]) {
+        for (const candidate of iceCandidateQueue[from]) {
+          await peer.addIceCandidate(candidate);
+        }
+        iceCandidateQueue[from] = [];
+      }
+
+      const answer = await peer.createAnswer();
+      await peer.setLocalDescription(answer);
+      peerStates[from].localDescriptionSet = true;
+      
+      socket.emit("answer", {
+        roomId: roomId.value,
+        answer: {
+          type: answer.type,
+          sdp: answer.sdp,
+        },
+        to: from,
+      });
+    }
   } catch (err) {
     console.error("Error handling offer:", err);
   }
@@ -158,12 +214,24 @@ socket.on("answer", async ({ from, answer }) => {
   
   if (peers[from]) {
     try {
-      await peers[from].setRemoteDescription(
-        new RTCSessionDescription({
-          type: answer.type,
-          sdp: answer.sdp,
-        })
-      );
+      // Only set remote description if we haven't already
+      if (!peerStates[from].remoteDescriptionSet) {
+        await peers[from].setRemoteDescription(
+          new RTCSessionDescription({
+            type: answer.type,
+            sdp: answer.sdp,
+          })
+        );
+        peerStates[from].remoteDescriptionSet = true;
+
+        // Process queued ICE candidates
+        if (iceCandidateQueue[from]) {
+          for (const candidate of iceCandidateQueue[from]) {
+            await peers[from].addIceCandidate(candidate);
+          }
+          iceCandidateQueue[from] = [];
+        }
+      }
     } catch (err) {
       console.error("Error handling answer:", err);
     }
@@ -174,22 +242,29 @@ socket.on("answer", async ({ from, answer }) => {
 socket.on("ice-candidate", async ({ from, candidate }) => {
   if (peers[from]) {
     try {
-      if (
-        candidate &&
-        candidate.candidate &&
-        candidate.sdpMLineIndex !== undefined
-      ) {
-        await peers[from].addIceCandidate(
-          new RTCIceCandidate({
-            candidate: candidate.candidate,
-            sdpMLineIndex: candidate.sdpMLineIndex,
-            sdpMid: candidate.sdpMid,
-          })
-        );
+      if (candidate && candidate.candidate) {
+        console.log("Received ICE candidate from", from, "sdpMLineIndex:", candidate.sdpMLineIndex);
+        
+        const iceCandidate = new RTCIceCandidate({
+          candidate: candidate.candidate,
+          sdpMLineIndex: candidate.sdpMLineIndex !== undefined ? candidate.sdpMLineIndex : 0,
+          sdpMid: candidate.sdpMid || undefined,
+        });
+        
+        if (peerStates[from] && peerStates[from].remoteDescriptionSet) {
+          await peers[from].addIceCandidate(iceCandidate);
+          console.log("✅ Added ICE candidate from", from);
+        } else {
+          if (!iceCandidateQueue[from]) iceCandidateQueue[from] = [];
+          iceCandidateQueue[from].push(iceCandidate);
+          console.log("⏳ Queued ICE candidate from", from);
+        }
       }
     } catch (err) {
-      console.error("Error adding ICE candidate:", err);
+      console.error("Error adding ICE candidate from", from, ":", err.message);
     }
+  } else {
+    console.log("⚠️ Peer connection not found for", from);
   }
 });
 
@@ -199,8 +274,19 @@ socket.on("user-disconnected", (userId) => {
   if (peers[userId]) {
     peers[userId].close();
     delete peers[userId];
-    delete remoteVideos[userId];
   }
+  remoteVideos.value.delete(userId);
+  if (remoteVideoRefs[userId]) {
+    remoteVideoRefs[userId].srcObject = null;
+    delete remoteVideoRefs[userId];
+  }
+});
+
+// Handle room full
+socket.on("room-full", (roomId) => {
+  console.log(`Room ${roomId} is full`);
+  connectionStatus.value = "Room Full (Max 2 users)";
+  alert("This room is already full! Maximum 2 users allowed.");
 });
 
 // Toggle video
@@ -227,14 +313,20 @@ function toggleAudio() {
 function hangUp() {
   localStream.value?.getTracks().forEach((track) => track.stop());
   Object.values(peers).forEach((peer) => peer.close());
+  remoteVideos.value.clear();
+  Object.keys(remoteVideoRefs).forEach((userId) => {
+    remoteVideoRefs[userId].srcObject = null;
+    delete remoteVideoRefs[userId];
+  });
   socket.emit("disconnect");
-  window.location.reload();
+  setTimeout(() => window.location.reload(), 500);
 }
 
-onMounted(async () => {
-  await startCamera();
-  socket.emit("join-room", roomId.value);
+onMounted(() => {
+  // Do not automatically join to prevent autoplay blocks
 });
+
+// Removed the explicit watcher, as srcObject is now handled dynamically in the ref template
 </script>
 
 <template>
@@ -254,7 +346,16 @@ onMounted(async () => {
 
     <!-- Main video area -->
     <main class="main">
-      <div class="videos-grid">
+      
+      <!-- Join Screen Overlay -->
+      <div v-if="!hasJoined" class="join-screen">
+        <h2 style="margin-bottom: 2rem;">Ready to join the room?</h2>
+        <button @click="joinCall" class="control-btn" style="font-size: 1.2rem; padding: 1rem 2rem;">
+          🚀 Join Call
+        </button>
+      </div>
+
+      <div v-show="hasJoined" class="videos-grid">
         <!-- Local video -->
         <div class="video-container local">
           <video
@@ -269,28 +370,39 @@ onMounted(async () => {
 
         <!-- Remote videos -->
         <div
-          v-for="(stream, userId) in remoteVideos"
+          v-for="[userId, stream] in remoteVideos"
           :key="userId"
           class="video-container remote"
         >
           <video
-            :srcObject="stream"
+            :ref="el => {
+              if (el) {
+                remoteVideoRefs[userId] = el;
+                if (el.srcObject !== stream) {
+                  el.srcObject = stream;
+                }
+                // Add event listeners for debugging
+                el.onloadstart = () => console.log(`Video ${userId} loadstart`);
+                el.onplay = () => console.log(`Video ${userId} play`);
+                el.onerror = (e) => console.error(`Video ${userId} error:`, e);
+              }
+            }"
             autoplay
             playsinline
             class="video"
           ></video>
-          <div class="video-label">User {{ userId.slice(0, 5) }}</div>
+          <div class="video-label">{{ typeof userId === 'string' ? userId.slice(0, 5) : 'User' }}</div>
         </div>
       </div>
 
       <!-- Empty state message -->
-      <div v-if="Object.keys(remoteVideos).length === 0" class="empty-state">
+      <div v-if="hasJoined && remoteVideos.size === 0" class="empty-state">
         <p>Waiting for others to join...</p>
       </div>
     </main>
 
     <!-- Controls -->
-    <footer class="controls">
+    <footer v-if="hasJoined" class="controls">
       <button
         @click="toggleVideo"
         class="control-btn"
@@ -446,6 +558,19 @@ onMounted(async () => {
   font-size: 0.85rem;
   font-weight: 600;
   backdrop-filter: blur(5px);
+}
+
+.join-screen {
+  position: absolute;
+  top: 0; left: 0; right: 0; bottom: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  background: rgba(0,0,0,0.4);
+  backdrop-filter: blur(8px);
+  z-index: 10;
+  border-radius: 15px;
 }
 
 .empty-state {
