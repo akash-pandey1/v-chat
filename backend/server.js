@@ -8,17 +8,17 @@ dotenv.config();
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
-    cors: {
-        origin: process.env.PROD_FRONTEND || "http://localhost:5173",
-        methods: ["GET", "POST"],
-    },
+  cors: {
+    origin: process.env.PROD_FRONTEND,
+    methods: ["GET", "POST"],
+  },
 });
 
-app.use(cors( {
-    origin: process.env.PROD_FRONTEND || "http://localhost:5173",
-    methods: ["GET", "POST"],
-    credentials: true
-    
+app.use(cors({
+  origin: process.env.PROD_FRONTEND,
+  methods: ["GET", "POST"],
+  credentials: true
+
 }));
 
 app.get('/health', (req, res) => {
@@ -32,13 +32,13 @@ io.on("connection", (socket) => {
   socket.on("join-room", (roomId) => {
     const usersInRoom = io.sockets.adapter.rooms.get(roomId);
     const userCount = usersInRoom ? usersInRoom.size : 0;
-    
+
     if (userCount >= 2) {
       socket.emit("room-full", roomId);
       console.log(`User ${socket.id} tried to join full room ${roomId}`);
       return;
     }
-    
+
     socket.join(roomId);
     console.log(`User ${socket.id} joined room ${roomId}. Total users: ${userCount + 1}`);
 
@@ -74,7 +74,7 @@ io.on("connection", (socket) => {
   });
 });
 
-const PORT = process.env.PORT 
+const PORT = process.env.PORT
 
 server.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`)
