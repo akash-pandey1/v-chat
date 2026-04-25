@@ -49,7 +49,11 @@ async function createPeerConnection(userId, initiator = false) {
     if (event.candidate) {
       socket.emit("ice-candidate", {
         roomId: roomId.value,
-        candidate: event.candidate,
+        candidate: {
+          candidate: event.candidate.candidate,
+          sdpMLineIndex: event.candidate.sdpMLineIndex,
+          sdpMid: event.candidate.sdpMid,
+        },
         to: userId,
       });
     }
@@ -85,7 +89,14 @@ socket.on("existing-users", async (users) => {
     const peer = await createPeerConnection(userId, true);
     const offer = await peer.createOffer();
     await peer.setLocalDescription(offer);
-    socket.emit("offer", { roomId: roomId.value, offer, to: userId });
+    socket.emit("offer", {
+      roomId: roomId.value,
+      offer: {
+        type: offer.type,
+        sdp: offer.sdp,
+      },
+      to: userId,
+    });
   }
 });
 
@@ -95,25 +106,67 @@ socket.on("user-joined", async (userId) => {
   const peer = await createPeerConnection(userId, true);
   const offer = await peer.createOffer();
   await peer.setLocalDescription(offer);
-  socket.emit("offer", { roomId: roomId.value, offer, to: userId });
+  socket.emit("offer", {
+    roomId: roomId.value,
+    offer: {
+      type: offer.type,
+      sdp: offer.sdp,
+    },
+    to: userId,
+  });
 });
 
 // Receive offer
 socket.on("offer", async ({ from, offer }) => {
   console.log("Received offer from:", from);
+  if (!offer || !offer.type || !offer.sdp) {
+    console.error("Invalid offer received:", offer);
+    return;
+  }
+  
   const peer = await createPeerConnection(from, false);
-  await peer.setRemoteDescription(new RTCSessionDescription(offer));
+  try {
+    await peer.setRemoteDescription(
+      new RTCSessionDescription({
+        type: offer.type,
+        sdp: offer.sdp,
+      })
+    );
 
-  const answer = await peer.createAnswer();
-  await peer.setLocalDescription(answer);
-  socket.emit("answer", { roomId: roomId.value, answer, to: from });
+    const answer = await peer.createAnswer();
+    await peer.setLocalDescription(answer);
+    socket.emit("answer", {
+      roomId: roomId.value,
+      answer: {
+        type: answer.type,
+        sdp: answer.sdp,
+      },
+      to: from,
+    });
+  } catch (err) {
+    console.error("Error handling offer:", err);
+  }
 });
 
 // Receive answer
 socket.on("answer", async ({ from, answer }) => {
   console.log("Received answer from:", from);
+  if (!answer || !answer.type || !answer.sdp) {
+    console.error("Invalid answer received:", answer);
+    return;
+  }
+  
   if (peers[from]) {
-    await peers[from].setRemoteDescription(new RTCSessionDescription(answer));
+    try {
+      await peers[from].setRemoteDescription(
+        new RTCSessionDescription({
+          type: answer.type,
+          sdp: answer.sdp,
+        })
+      );
+    } catch (err) {
+      console.error("Error handling answer:", err);
+    }
   }
 });
 
@@ -121,7 +174,19 @@ socket.on("answer", async ({ from, answer }) => {
 socket.on("ice-candidate", async ({ from, candidate }) => {
   if (peers[from]) {
     try {
-      await peers[from].addIceCandidate(new RTCIceCandidate(candidate));
+      if (
+        candidate &&
+        candidate.candidate &&
+        candidate.sdpMLineIndex !== undefined
+      ) {
+        await peers[from].addIceCandidate(
+          new RTCIceCandidate({
+            candidate: candidate.candidate,
+            sdpMLineIndex: candidate.sdpMLineIndex,
+            sdpMid: candidate.sdpMid,
+          })
+        );
+      }
     } catch (err) {
       console.error("Error adding ICE candidate:", err);
     }
